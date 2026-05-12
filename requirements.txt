@@ -1,0 +1,20 @@
+# Crypto ACO — Requirements
+# Install: pip install -r requirements.txt
+
+# ── LLM: Groq + LangChain (formal libraries) ────────────────
+langchain>=0.3.0
+langchain-core>=0.3.0
+langchain-groq>=0.2.0          # ChatGroq with with_structured_output
+
+# ── Data validation (Pydantic v2 for structured output) ──────
+pydantic>=2.5.0
+
+# ── Market data feed ─────────────────────────────────────────
+requests>=2.32.0
+
+# ── MeTTa interpreter ────────────────────────────────────────
+# pettaSH is installed separately as a shell command:
+#   git clone https://github.com/trueagi-io/metta-wam
+#   cd metta-wam && make install
+# Then verify: petta --version
+# The Python bridge calls it via subprocess — no pip package needed.

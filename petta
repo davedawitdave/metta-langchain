@@ -1,0 +1,20 @@
+#!/bin/bash
+# Wrapper script to make PeTTa v1.0.2 compatible with petta sh syntax
+# Usage: petta sh <file.metta>
+
+PETTA_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/PeTTa" && pwd)"
+
+if [ "$1" = "--version" ]; then
+    echo "petta v1.0.2 (PeTTa wrapper)"
+    exit 0
+fi
+
+if [ "$1" != "sh" ]; then
+    echo "Usage: petta sh <file.metta>"
+    exit 1
+fi
+
+METTA_FILE="$2"
+
+# Use PeTTa's run.sh script to execute the metta file
+bash "$PETTA_DIR/run.sh" "$METTA_FILE"
