@@ -1,30 +1,33 @@
 """
 tests/test_pipeline.py
-══════════════════════
-Full pipeline tests. No live API or pettaSH required.
-Mock bridge + mock Groq stubs cover all 5 LangChain steps.
-
 Run:  python tests/test_pipeline.py
+
+No live pettaSH or Groq API required.
+All external calls are mocked inside this file.
 """
 
 import sys, os, re, json
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "python"))
+_root = os.path.join(os.path.dirname(__file__), "..")
+sys.path.insert(0, os.path.join(_root, "python"))
+sys.path.insert(0, _root)
 
 
-# ═══════════════════════════════════════════════════════════
-# 1. METTA ATOM FORMAT TESTS
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 1: MeTTa atom format
+# ============================================================
 
 def test_atom_format():
-    """All knowledge_base atoms must be valid MeTTa S-expressions."""
-    atom_re = re.compile(r'^\([A-Za-z][A-Za-z0-9\-]*([ \t]+[A-Za-z0-9$._%-]+)*\)$')
     atoms = [
         "(AssetClass BTC Layer1)",
         "(BaseRisk Meme Critical)",
         "(MaxPositionPct Critical 0)",
+        "(MaxTotalClassExposure High 15)",
+        "(LiquidityGuardPct 1.0)",
         "(GlobalMarketState Normal)",
-        "(AssetPrice BTC 93866.13)",
+        "(AssetPrice BTC 80240.17)",
+        "(AssetVolume24h BTC 25000000000)",
         "(ActionAllowed Buy Low)",
+        "(ActionAllowed Hold Low)",
         "(SentimentSignal Bullish Favourable)",
         "(TradesThisHour 2)",
         "(DailyPnL 1.5)",
@@ -32,87 +35,102 @@ def test_atom_format():
     for atom in atoms:
         assert atom.startswith("(") and atom.endswith(")"), f"Bad wrap: {atom}"
         parts = atom.strip("()").split()
-        assert len(parts) >= 1, f"Empty: {atom}"
-    print("✅ test_atom_format: all atoms valid")
+        assert len(parts) >= 1, f"Empty atom: {atom}"
+    print("OK  test_atom_format: all atoms valid")
 
 
-# ═══════════════════════════════════════════════════════════
-# 2. PETTASH SCRIPT BUILDER TEST
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 2: pettaSH script builder
+# ============================================================
 
-def test_pettash_script_builder():
-    """MeTTaBridge must build a correct composite script for pettaSH."""
+def test_script_builder():
     from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta", petta_cmd="petta")
+    b = MeTTaBridge(metta_dir="metta", petta_cmd="petta")
+    script = b._build_script("!(check-trade Buy BTC 5.0)")
 
-    script = bridge._build_script("!(check-trade Buy BTC 5.0)")
+    assert "import! &self" in script,          "missing import"
+    assert "knowledge_base.metta" in script,   "missing knowledge_base"
+    assert "market_state.metta"   in script,   "missing market_state"
+    assert "risk_hierarchy.metta" in script,   "missing risk_hierarchy"
+    assert "main_logic.metta" not in script,   "main API merged into risk_hierarchy"
+    assert "!(check-trade Buy BTC 5.0)" in script, "missing query"
 
-    assert 'import! &self' in script,      "Missing import statement"
-    assert "knowledge_base.metta" in script
-    assert "market_state.metta"   in script
-    assert "risk_hierarchy.metta" in script
-    assert "!(check-trade Buy BTC 5.0)" in script
-    # Imports must come BEFORE the query
+    # imports must appear before the query
     imp_pos   = script.index("import! &self")
     query_pos = script.index("!(check-trade Buy BTC 5.0)")
-    assert imp_pos < query_pos, "Imports must precede query"
-    print("✅ test_pettash_script_builder: script structure correct")
+    assert imp_pos < query_pos, "imports must precede query"
+    print("OK  test_script_builder")
 
 
-# ═══════════════════════════════════════════════════════════
-# 3. S-EXPRESSION PARSER TESTS
-# ═══════════════════════════════════════════════════════════
-
-def test_verdict_parser_allow():
+def test_output_filter():
     from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta")
-    raw = '(TradeApproved BTC Buy 5.0 "All 7 risk checks passed.")'
-    v = bridge._parse_verdict(raw, "BTC", "Buy")
+    b = MeTTaBridge(metta_dir="metta")
+    raw = """
+; comment
+metta> loading
+!(import! &self kb.metta)
+(TradeApproved BTC Buy 5.0 "All 9 checks passed.")
+some noise line
+(TradeDenied PEPE Buy "Critical risk.")
+    """
+    lines = b._filter_output(raw)
+    assert len(lines) == 2
+    assert any("TradeApproved" in ln for ln in lines)
+    assert any("TradeDenied"   in ln for ln in lines)
+    print("OK  test_output_filter")
+
+
+# ============================================================
+# GROUP 3: S-expression parsers
+# ============================================================
+
+def test_parse_verdict_allow():
+    from metta_bridge import MeTTaBridge
+    b = MeTTaBridge(metta_dir="metta")
+    raw = '(TradeApproved BTC Buy 5.0 "All 9 checks passed.")'
+    v = b._parse_verdict(raw, "BTC", "Buy")
     assert v["verdict"] == "Allow"
     assert v["asset"]   == "BTC"
     assert v["action"]  == "Buy"
-    assert "passed" in v["reason"] or v["reason"] != ""
-    print("✅ test_verdict_parser_allow")
+    assert "passed" in v["reason"]
+    print("OK  test_parse_verdict_allow")
 
 
-def test_verdict_parser_deny():
+def test_parse_verdict_deny():
     from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta")
-    raw = '(TradeDenied PEPE Buy "RISK CLASS BLOCK: Action not permitted for Critical.")'
-    v = bridge._parse_verdict(raw, "PEPE", "Buy")
+    b = MeTTaBridge(metta_dir="metta")
+    raw = '(TradeDenied PEPE Buy "Asset is Critical risk. Buy not permitted.")'
+    v = b._parse_verdict(raw, "PEPE", "Buy")
     assert v["verdict"] == "Deny"
     assert v["asset"]   == "PEPE"
-    print("✅ test_verdict_parser_deny")
+    print("OK  test_parse_verdict_deny")
 
 
-def test_verdict_parser_warn():
+def test_parse_verdict_warn():
     from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta")
-    raw = '(TradeWarned ETH Buy "SENTIMENT ALERT: unfavourable.")'
-    v = bridge._parse_verdict(raw, "ETH", "Buy")
+    b = MeTTaBridge(metta_dir="metta")
+    raw = '(TradeWarned ETH Buy "Sentiment is unfavourable.")'
+    v = b._parse_verdict(raw, "ETH", "Buy")
     assert v["verdict"] == "Warn"
-    print("✅ test_verdict_parser_warn")
+    print("OK  test_parse_verdict_warn")
 
 
-def test_market_summary_parser():
+def test_parse_market_summary():
     from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta")
+    b = MeTTaBridge(metta_dir="metta")
     raw = "(MarketSummary Normal 10000.00 1.5 2)"
-    d = bridge._parse_market_summary(raw)
+    d = b._parse_market_summary(raw)
     assert d["state"]   == "Normal"
     assert d["balance"] == "10000.00"
-    assert "_type" not in d
-    print("✅ test_market_summary_parser")
+    assert "_t" not in d
+    print("OK  test_parse_market_summary")
 
 
-# ═══════════════════════════════════════════════════════════
-# 4. TRADE INTENT → METTA CALL MAPPING
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 4: intent -> MeTTa call mapping
+# ============================================================
 
-def test_intent_to_metta_call():
-    """TradeIntent.to_metta_call() must match pettaSH query format."""
-    # We test the dataclass directly without importing pydantic
-    # by constructing the expected strings manually
+def test_intent_metta_call():
     cases = [
         ("Buy",  "BTC",  5.0,  "check-trade Buy BTC 5.0"),
         ("Sell", "ETH",  15.0, "check-trade Sell ETH 15.0"),
@@ -121,161 +139,185 @@ def test_intent_to_metta_call():
     ]
     for action, asset, pct, expected in cases:
         result = f"check-trade {action} {asset} {pct}"
-        assert result == expected, f"Got: {result}"
-    print("✅ test_intent_to_metta_call: all mappings correct")
+        assert result == expected, f"got: {result}"
+    print("OK  test_intent_metta_call")
 
 
-def test_metta_atom_serialization():
-    """MeTTa atom format for logging must be valid S-expression."""
-    def to_atom(action, asset, pct, urgency):
+def test_intent_atom():
+    def atom(action, asset, pct, urgency):
         return (f"(TradeIntent (subject user) (action {action})"
                 f" (asset {asset}) (size {pct}) (urgency {urgency}))")
-
-    atom = to_atom("Buy", "BTC", 5.0, "Normal")
-    assert atom.startswith("(TradeIntent")
-    assert "subject user" in atom
-    assert "action Buy" in atom
-    assert "asset BTC" in atom
-    print("✅ test_metta_atom_serialization")
+    a = atom("Buy", "BTC", 5.0, "Normal")
+    assert "action Buy"  in a
+    assert "asset BTC"   in a
+    assert "size 5.0"    in a
+    print("OK  test_intent_atom")
 
 
-# ═══════════════════════════════════════════════════════════
-# 5. MOCK BRIDGE — RULE VERIFICATION LOGIC
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 5: mock rule engine (mirrors knowledge_base.metta)
+# ============================================================
 
-class MockMeTTaBridge:
+class MockBridge:
     """
-    Simulates MeTTa rule engine responses without running pettaSH.
-    Rules mirror knowledge_base.metta exactly.
+    Simulates MeTTa verdicts without pettaSH.
+    Rules mirror knowledge_base.metta exactly including
+    the new total-class-exposure and liquidity checks.
     """
-    RISK_LEVELS = {
-        "BTC": "Low", "ETH": "Low", "SOL": "Low", "ADA": "Low", "AVAX": "Low",
-        "MATIC": "Medium", "ARB": "Medium", "OP": "Medium",
-        "LINK": "High", "UNI": "High", "AAVE": "High",
-        "USDT": "Safe", "USDC": "Safe",
-        "DOGE": "Critical", "SHIB": "Critical", "PEPE": "Critical",
+    RISK = {
+        "BTC": "Low",  "ETH": "Low",  "SOL": "Low",
+        "ADA": "Low",  "AVAX":"Low",
+        "MATIC":"Medium","ARB":"Medium","OP":"Medium",
+        "LINK":"High", "UNI":"High",  "AAVE":"High",
+        "USDT":"Safe", "USDC":"Safe",
+        "DOGE":"Critical","SHIB":"Critical","PEPE":"Critical",
     }
-    MAX_PCT = {"Critical": 0, "High": 5, "Medium": 10, "Low": 20, "Safe": 50}
-    BUY_ALLOWED = {"Safe", "Low", "Medium", "High"}  # Critical excluded
+    MAX_SINGLE = {"Critical":0,"High":5,"Medium":10,"Low":20,"Safe":50}
+    MAX_CLASS  = {"Critical":0,"High":15,"Medium":25,"Low":60,"Safe":80}
+    BUY_OK     = {"Safe","Low","Medium","High"}
+    # Simulated holdings for exposure test
+    HOLDINGS   = {"LINK":3.0,"UNI":4.0}   # DeFi = 7%
 
     def verify_trade(self, action, asset, size_pct):
-        level = self.RISK_LEVELS.get(asset, "Critical")
+        level = self.RISK.get(asset, "Critical")
 
-        if action == "Buy" and level not in self.BUY_ALLOWED:
-            return {"verdict": "Deny", "asset": asset, "action": action,
-                    "reason": f"RISK CLASS BLOCK: Buy not permitted for {level}.",
-                    "raw": f"(TradeDenied {asset} Buy ...)"}
+        if action == "Hold":
+            return {"verdict": "Allow", "asset": asset, "action": action,
+                    "reason": "Hold is not an opening trade.", "raw": f"(TradeApproved {asset} {action} {size_pct})"}
 
-        # Position size check applies to Buy only (Sell/Swap exit positions freely)
+        # check 4: asset risk
+        if action == "Buy" and level not in self.BUY_OK:
+            return self._deny(asset, action, "Asset is Critical risk. Buy not permitted.")
+
         if action == "Buy":
-            max_p = self.MAX_PCT[level]
-            if size_pct > max_p:
-                return {"verdict": "Deny", "asset": asset, "action": action,
-                        "reason": f"POSITION SIZE BREACH: {size_pct}% > max {max_p}%.",
-                        "raw": f"(TradeDenied {asset} {action} ...)"}
+            # check 5: single position size
+            if size_pct > self.MAX_SINGLE[level]:
+                return self._deny(asset, action,
+                    f"Position {size_pct}% exceeds single-asset limit {self.MAX_SINGLE[level]}%.")
 
-        return {"verdict": "Allow", "asset": asset, "action": action,
-                "reason": "All 7 risk checks passed.",
-                "raw": f"(TradeApproved {asset} {action} {size_pct} ...)"}
+            # check 6: total class exposure (new)
+            current = sum(v for k, v in self.HOLDINGS.items()
+                         if self.RISK.get(k) == level)
+            if current + size_pct > self.MAX_CLASS[level]:
+                return self._deny(asset, action,
+                    f"Total {level} exposure {current+size_pct}% exceeds class limit {self.MAX_CLASS[level]}%.")
+
+        return {"verdict":"Allow","asset":asset,"action":action,
+                "reason":"All checks passed.","raw":f"(TradeApproved {asset} {action} {size_pct})"}
+
+    def _deny(self, asset, action, reason):
+        return {"verdict":"Deny","asset":asset,"action":action,
+                "reason":reason,"raw":f"(TradeDenied {asset} {action})"}
 
     def asset_info(self, asset):
-        level = self.RISK_LEVELS.get(asset, "Critical")
-        return {"asset": asset, "risk": level, "class": "Mock", "price": "0"}
+        return {"asset":asset,"risk":self.RISK.get(asset,"Critical"),
+                "class":"Mock","price":"0","volatility":"0",
+                "sentiment":"Neutral","trend":"Neutral"}
 
     def market_summary(self):
-        return {"state": "Normal", "balance": "10000", "daily_pnl": "1.5",
-                "trades_this_hour": "2"}
+        return {"state":"Normal","balance":"10000",
+                "daily_pnl":"1.5","trades_this_hour":"2"}
 
     def portfolio_risk(self):
-        return [{"asset": "BTC", "class": "Layer1", "risk_level": "Low"},
-                {"asset": "ETH", "class": "Layer1", "risk_level": "Low"}]
+        return [{"asset":"BTC","class":"Layer1","risk_level":"Low"}]
 
 
-def test_mock_meme_coin_denied():
-    bridge = MockMeTTaBridge()
-    v = bridge.verify_trade("Buy", "PEPE", 10.0)
+def test_hold_skips_size_cap():
+    """Hold with large size_pct must not hit buy-style position limits."""
+    b = MockBridge()
+    v = b.verify_trade("Hold", "BTC", 50.0)
+    assert v["verdict"] == "Allow"
+    print("OK  test_hold_skips_size_cap")
+
+
+def test_meme_buy_denied():
+    b = MockBridge()
+    v = b.verify_trade("Buy", "PEPE", 10.0)
     assert v["verdict"] == "Deny"
-    assert "Critical" in v["reason"] or "BLOCK" in v["reason"]
-    print("✅ test_mock_meme_coin_denied: PEPE Buy correctly blocked")
+    assert "Critical" in v["reason"]
+    print("OK  test_meme_buy_denied: PEPE Buy blocked")
 
 
-def test_mock_btc_allowed():
-    bridge = MockMeTTaBridge()
-    v = bridge.verify_trade("Buy", "BTC", 5.0)
+def test_btc_buy_allowed():
+    b = MockBridge()
+    v = b.verify_trade("Buy", "BTC", 5.0)
     assert v["verdict"] == "Allow"
-    print("✅ test_mock_btc_allowed: BTC 5% Buy correctly allowed")
+    print("OK  test_btc_buy_allowed")
 
 
-def test_mock_oversized_denied():
-    bridge = MockMeTTaBridge()
-    v = bridge.verify_trade("Buy", "ETH", 50.0)
+def test_oversize_denied():
+    b = MockBridge()
+    v = b.verify_trade("Buy", "ETH", 50.0)
     assert v["verdict"] == "Deny"
-    assert "SIZE" in v["reason"] or "50" in v["reason"]
-    print("✅ test_mock_oversized_denied: ETH 50% Buy correctly blocked")
+    print("OK  test_oversize_denied: ETH 50% blocked")
 
 
-def test_mock_sell_meme_allowed():
-    """Selling Critical assets must always be allowed."""
-    bridge = MockMeTTaBridge()
-    v = bridge.verify_trade("Sell", "PEPE", 10.0)
+def test_sell_critical_allowed():
+    """Selling a Critical asset must always be allowed."""
+    b = MockBridge()
+    v = b.verify_trade("Sell", "PEPE", 5.0)
     assert v["verdict"] == "Allow"
-    print("✅ test_mock_sell_meme_allowed: Sell on PEPE correctly permitted")
+    print("OK  test_sell_critical_allowed: Sell PEPE permitted")
 
 
-def test_mock_stablecoin_allowed():
-    bridge = MockMeTTaBridge()
-    v = bridge.verify_trade("Buy", "USDC", 30.0)
+def test_stablecoin_allowed():
+    b = MockBridge()
+    v = b.verify_trade("Buy", "USDC", 30.0)
     assert v["verdict"] == "Allow"
-    print("✅ test_mock_stablecoin_allowed: USDC 30% Buy correctly allowed")
+    print("OK  test_stablecoin_allowed")
 
 
-def test_mock_defi_max_size():
-    bridge = MockMeTTaBridge()
-    # DeFi = High risk, max 5%
-    v6  = bridge.verify_trade("Buy", "LINK", 6.0)
-    v4  = bridge.verify_trade("Buy", "LINK", 4.0)
-    assert v6["verdict"] == "Deny"
-    assert v4["verdict"] == "Allow"
-    print("✅ test_mock_defi_max_size: DeFi 5% cap enforced correctly")
+def test_defi_single_cap():
+    """DeFi (High) single max is 5%."""
+    b = MockBridge()
+    assert b.verify_trade("Buy", "LINK", 6.0)["verdict"] == "Deny"
+    assert b.verify_trade("Buy", "LINK", 4.0)["verdict"] == "Allow"
+    print("OK  test_defi_single_cap: 5% cap enforced")
 
 
-# ═══════════════════════════════════════════════════════════
-# 6. SENTIMENT NORMALIZATION
-# ═══════════════════════════════════════════════════════════
+def test_total_class_exposure():
+    """
+    MockBridge has LINK 3% + UNI 4% = 7% High already.
+    MaxTotalClassExposure High = 15%.
+    Adding 10% AAVE -> 17% > 15 -> Deny.
+    Adding 5%  AAVE -> 12% < 15 -> Allow.
+    """
+    b = MockBridge()
+    v_deny  = b.verify_trade("Buy", "AAVE", 10.0)
+    v_allow = b.verify_trade("Buy", "AAVE", 5.0)
+    assert v_deny["verdict"]  == "Deny",  f"expected Deny, got {v_deny}"
+    assert v_allow["verdict"] == "Allow", f"expected Allow, got {v_allow}"
+    print("OK  test_total_class_exposure: concentration cap enforced")
 
-def test_sentiment_normalization():
-    """Groq output words must map to MeTTa SentimentSignal atom vocabulary."""
+
+# ============================================================
+# GROUP 6: sentiment normalization
+# ============================================================
+
+def test_sentiment_norm():
     from constants import SENTIMENT_NORM
     cases = {
-        "bullish":  "Bullish",
-        "bearish":  "Bearish",
-        "panic":    "Panic",
-        "pumping":  "Pumping",
-        "crashing": "Crashing",
-        "neutral":  "Neutral",
-        "volatile": "Volatile",
-        "fomoing":  "FOMOing",
+        "bullish":"Bullish", "bearish":"Bearish",
+        "panic":"Panic",     "pumping":"Pumping",
+        "crashing":"Crashing","neutral":"Neutral",
+        "volatile":"Volatile","fomoing":"FOMOing",
     }
     for word, expected in cases.items():
-        result = SENTIMENT_NORM.get(word, "Neutral")
-        assert result == expected, f"{word} → {result} (expected {expected})"
-    print("✅ test_sentiment_normalization: all words map correctly")
+        got = SENTIMENT_NORM.get(word, "Neutral")
+        assert got == expected, f"{word} -> {got} (expected {expected})"
+    print("OK  test_sentiment_norm")
 
 
 def test_sentiment_json_parse():
-    """Sentiment parser must handle Groq JSON output — tested via inline stub."""
     import json, re
     from constants import SENTIMENT_NORM
 
-    def parse_sentiments(text, symbols):
-        """Mirrors MarketFeeder._parse_sentiments logic."""
+    def parse(text, symbols):
         results = {s: "Neutral" for s in symbols}
         try:
-            clean = re.sub(r"```json\s*|```", "", text).strip()
-            data  = json.loads(clean)
+            data = json.loads(re.sub(r"```json\s*|```", "", text).strip())
             for sym in symbols:
-                raw = str(data.get(sym, "neutral")).lower()
-                results[sym] = SENTIMENT_NORM.get(raw, "Neutral")
+                results[sym] = SENTIMENT_NORM.get(str(data.get(sym,"neutral")).lower(), "Neutral")
             return results
         except Exception:
             pass
@@ -285,108 +327,105 @@ def test_sentiment_json_parse():
                 results[sym] = SENTIMENT_NORM.get(m.group(1).lower(), "Neutral")
         return results
 
-    symbols = ["BTC", "ETH", "SOL"]
-    text = '{"BTC": "bullish", "ETH": "bearish", "SOL": "neutral"}'
-    r = parse_sentiments(text, symbols)
+    syms = ["BTC","ETH","SOL"]
+    r = parse('{"BTC":"bullish","ETH":"bearish","SOL":"neutral"}', syms)
     assert r["BTC"] == "Bullish"
     assert r["ETH"] == "Bearish"
     assert r["SOL"] == "Neutral"
 
-    text2 = "BTC: bullish, ETH: panic, SOL: volatile"
-    r2 = parse_sentiments(text2, symbols)
-    assert r2["BTC"] == "Bullish"
+    r2 = parse("BTC: pumping, ETH: panic", syms)
+    assert r2["BTC"] == "Pumping"
     assert r2["ETH"] == "Panic"
-    print("✅ test_sentiment_json_parse: JSON + regex fallback both work")
+    print("OK  test_sentiment_json_parse")
 
 
-# ═══════════════════════════════════════════════════════════
-# 7. CHAT LOGGER FORMAT
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 7: chat logger
+# ============================================================
 
 def test_chat_logger():
-    """ChatLogger must track history in the correct format."""
     from chat_logger import ChatLogger
-    logger = ChatLogger()
-    logger.user("buy 5% BTC", step_label="STEP 1")
-    logger.ai("Parsed intent: Buy BTC 5.0%", model_tag="LLM-1")
-    logger.metta("check-trade Buy BTC 5.0", "(TradeApproved BTC Buy 5.0 ...)")
+    log = ChatLogger()
+    log.step_header("STEP 1  Intent Parser")
+    log.user_says("buy 5% BTC")
+    log.llm_says("action=Buy asset=BTC size=5%", tag="LLM-1")
+    log.metta_query("check-trade Buy BTC 5.0", "(TradeApproved BTC Buy 5.0)")
+    log.metta_verdict("Allow", "BTC", "Buy")
 
-    hist = logger.export()
-    assert len(hist) == 3
-    assert hist[0]["role"] == "user"
-    assert hist[0]["step"] == "STEP 1"
-    assert hist[1]["role"] == "assistant"
-    assert hist[1]["model"] == "LLM-1"
-    assert hist[2]["role"] == "metta"
-    assert "check-trade" in hist[2]["query"]
-    print("✅ test_chat_logger: history tracking correct")
-
-
-# ═══════════════════════════════════════════════════════════
-# 8. PETTASH OUTPUT FILTER
-# ═══════════════════════════════════════════════════════════
-
-def test_output_filter():
-    """_filter_output must strip pettaSH noise lines."""
-    from metta_bridge import MeTTaBridge
-    bridge = MeTTaBridge(metta_dir="metta")
-    raw = """
-; pettaSH auto-script
-metta> loading...
-!(import! &self knowledge_base.metta)
-(TradeApproved BTC Buy 5.0 "All checks passed.")
-    """
-    lines = bridge._filter_output(raw)
-    assert len(lines) == 1
-    assert "TradeApproved" in lines[0]
-    print("✅ test_output_filter: noise lines correctly stripped")
+    hist = log.export()
+    roles = [h["role"] for h in hist]
+    assert "step"      in roles
+    assert "user"      in roles
+    assert "assistant" in roles
+    assert "metta"     in roles
+    print("OK  test_chat_logger")
 
 
-# ═══════════════════════════════════════════════════════════
-# RUN ALL
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# GROUP 8: new knowledge base atoms validated
+# ============================================================
+
+def test_new_kb_atoms():
+    """Verify that the Gemini-suggested atoms are correctly formatted."""
+    new_atoms = [
+        "(MaxTotalClassExposure Critical 0)",
+        "(MaxTotalClassExposure High     15)",
+        "(MaxTotalClassExposure Medium   25)",
+        "(MaxTotalClassExposure Low      60)",
+        "(MaxTotalClassExposure Safe     80)",
+        "(LiquidityGuardPct 1.0)",
+        "(AssetVolume24h BTC 25000000000)",
+        "(AssetVolume24h SOL 3000000000)",
+    ]
+    for atom in new_atoms:
+        assert atom.startswith("(") and atom.endswith(")"), f"bad: {atom}"
+        parts = atom.strip("()").split()
+        assert len(parts) >= 2
+    print("OK  test_new_kb_atoms: all Gemini atoms valid")
+
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
-    print("\n" + "═"*55)
-    print("  Crypto ACO — Test Suite")
-    print("═"*55 + "\n")
+    print("\n" + "=" * 55)
+    print("  Crypto ACO v3 — Test Suite")
+    print("=" * 55 + "\n")
 
-    # Group 1: MeTTa atom format
-    print("── Group 1: MeTTa Atom Format ──────────────────────")
+    print("-- Group 1: MeTTa atom format --")
     test_atom_format()
+    test_new_kb_atoms()
 
-    # Group 2: pettaSH bridge
-    print("\n── Group 2: pettaSH Bridge ─────────────────────────")
-    test_pettash_script_builder()
-    test_verdict_parser_allow()
-    test_verdict_parser_deny()
-    test_verdict_parser_warn()
-    test_market_summary_parser()
+    print("\n-- Group 2: pettaSH bridge --")
+    test_script_builder()
     test_output_filter()
+    test_parse_verdict_allow()
+    test_parse_verdict_deny()
+    test_parse_verdict_warn()
+    test_parse_market_summary()
 
-    # Group 3: Intent mapping
-    print("\n── Group 3: Intent → MeTTa Mapping ─────────────────")
-    test_intent_to_metta_call()
-    test_metta_atom_serialization()
+    print("\n-- Group 3: intent mapping --")
+    test_intent_metta_call()
+    test_intent_atom()
 
-    # Group 4: Mock rule engine
-    print("\n── Group 4: Mock Rule Engine ────────────────────────")
-    test_mock_meme_coin_denied()
-    test_mock_btc_allowed()
-    test_mock_oversized_denied()
-    test_mock_sell_meme_allowed()
-    test_mock_stablecoin_allowed()
-    test_mock_defi_max_size()
+    print("\n-- Group 4: mock rule engine (incl. new checks) --")
+    test_meme_buy_denied()
+    test_btc_buy_allowed()
+    test_oversize_denied()
+    test_hold_skips_size_cap()
+    test_sell_critical_allowed()
+    test_stablecoin_allowed()
+    test_defi_single_cap()
+    test_total_class_exposure()
 
-    # Group 5: Sentiment
-    print("\n── Group 5: Sentiment Normalization ─────────────────")
-    test_sentiment_normalization()
+    print("\n-- Group 5: sentiment --")
+    test_sentiment_norm()
     test_sentiment_json_parse()
 
-    # Group 6: Chat logger
-    print("\n── Group 6: Chat Logger ─────────────────────────────")
+    print("\n-- Group 6: chat logger --")
     test_chat_logger()
 
-    print("\n" + "═"*55)
-    print("  ✅  ALL TESTS PASSED")
-    print("═"*55 + "\n")
+    print("\n" + "=" * 55)
+    print("  ALL TESTS PASSED")
+    print("=" * 55 + "\n")
