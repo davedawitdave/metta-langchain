@@ -1,23 +1,24 @@
 """
-constants.py — Shared constants with no external dependencies.
-Imported by both market_feeder.py and the test suite.
+constants.py
+Shared lookup tables with no external dependencies.
+Imported by market_feeder.py and the test suite.
 """
 
-# Maps Groq/LLM sentiment words → MeTTa SentimentSignal atom vocabulary
-# These keys match what the LLM is instructed to return in SENTIMENT_HUMAN prompt.
+# Maps LLM sentiment words -> MeTTa SentimentSignal atom vocabulary.
+# Keys are lowercase; values are the exact atoms in knowledge_base.metta.
 SENTIMENT_NORM: dict[str, str] = {
-    "bull":      "Bullish",  "bullish":  "Bullish",
-    "bear":      "Bearish",  "bearish":  "Bearish",
-    "neutral":   "Neutral",  "uncertain":"Neutral",  "mixed": "Neutral",
-    "panic":     "Panic",    "fear":     "Panic",
-    "crash":     "Crashing", "crashing": "Crashing",
-    "pump":      "Pumping",  "pumping":  "Pumping",  "rallying": "Pumping",
-    "dump":      "Dumping",  "dumping":  "Dumping",
-    "fomo":      "FOMOing",  "fomoing":  "FOMOing",
-    "volatile":  "Volatile", "volatility":"Volatile",
+    "bull":       "Bullish",  "bullish":    "Bullish",
+    "bear":       "Bearish",  "bearish":    "Bearish",
+    "neutral":    "Neutral",  "uncertain":  "Neutral",  "mixed":    "Neutral",
+    "panic":      "Panic",    "fear":       "Panic",
+    "crash":      "Crashing", "crashing":   "Crashing",
+    "pump":       "Pumping",  "pumping":    "Pumping",  "rallying": "Pumping",
+    "dump":       "Dumping",  "dumping":    "Dumping",
+    "fomo":       "FOMOing",  "fomoing":    "FOMOing",
+    "volatile":   "Volatile", "volatility": "Volatile",
 }
 
-# CoinPaprika coin IDs for the REST API
+# CoinPaprika REST API coin IDs.
 COIN_IDS: dict[str, str] = {
     "BTC":  "btc-bitcoin",
     "ETH":  "eth-ethereum",
@@ -34,11 +35,22 @@ COIN_IDS: dict[str, str] = {
     "SHIB": "shib-shiba-inu",
 }
 
-# Asset → risk level (mirrors knowledge_base.metta — kept in sync manually)
+# Mirror of knowledge_base.metta (AssetClass column).
+ASSET_CLASS: dict[str, str] = {
+    "BTC": "Layer1", "ETH": "Layer1", "SOL": "Layer1",
+    "ADA": "Layer1", "AVAX": "Layer1",
+    "MATIC": "Layer2", "ARB": "Layer2", "OP": "Layer2",
+    "LINK": "DeFi", "UNI": "DeFi", "AAVE": "DeFi",
+    "USDT": "Stablecoin", "USDC": "Stablecoin",
+    "DOGE": "Meme", "SHIB": "Meme", "PEPE": "Meme",
+}
+
+# Mirror of knowledge_base.metta risk levels — for mock bridge in tests.
 ASSET_RISK_LEVELS: dict[str, str] = {
-    "BTC": "Low",  "ETH": "Low",  "SOL": "Low",  "ADA": "Low",  "AVAX": "Low",
-    "MATIC": "Medium", "ARB": "Medium", "OP": "Medium",
-    "LINK": "High", "UNI": "High", "AAVE": "High",
+    "BTC":  "Low",  "ETH":  "Low",  "SOL":  "Low",
+    "ADA":  "Low",  "AVAX": "Low",
+    "MATIC":"Medium","ARB":  "Medium","OP":   "Medium",
+    "LINK": "High", "UNI":  "High", "AAVE": "High",
     "USDT": "Safe", "USDC": "Safe",
-    "DOGE": "Critical", "SHIB": "Critical", "PEPE": "Critical",
+    "DOGE": "Critical","SHIB":"Critical","PEPE":"Critical",
 }

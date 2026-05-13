@@ -1,5 +1,14 @@
 # Crypto ACO — Algorithmic Compliance Officer
-### MeTTa (pettaSH) + LangChain + Groq/Llama — Neuro-Symbolic Trading Guardrail
+### MeTTa (PeTTa) + LangChain + Groq/Llama — Neuro-Symbolic Trading Guardrail
+
+**Key Feature:** Unrelated questions get raw LLM answers with "You:" prefix. Trading queries run the full 4-step ACO pipeline.
+
+---
+
+## Smart Query Routing
+
+- **Trading-related** (buy/sell/hold/swap): Full 4-step ACO pipeline with MeTTa verification
+- **Unrelated questions**: Raw LLM response with "You:" prefix format (no MeTTa verification)
 
 ---
 
@@ -19,7 +28,7 @@ Phase I — Intent Capture (L → R)
 Phase II — Symbolic Verification (R ← L)
 ────────────────────────────────────────────────────────────────
  (Verdict Deny   ←  risk_hierarchy.metta  ←  MeTTaBridge
-  PEPE Buy           7-check recursive        pettaSH
+  PEPE Buy           7-check recursive        PeTTa
   action-blocked)    verify-trade             subprocess
                      BRAIN: no LLM here       temp .metta file
 
@@ -43,16 +52,16 @@ Final Chat Output
 
 ---
 
-## The 5 LangChain LLM Calls
+## The Pipeline LLM Calls
 
-| Step | LLM | Role | LangChain API |
-|------|-----|------|---------------|
-| 1 | llama-3.3-70b | **Intent Decomposer** — extracts Subject/Action/Object | `with_structured_output(TradeIntent)` |
-| — | *pettaSH* | **Symbolic Verifier** — recursive 7-check rule engine | subprocess (NOT an LLM) |
-| 2 | llama-3.3-70b | **Risk Analyst** — reads MeTTa verdict + market context | `prompt \| llm \| StrOutputParser()` |
-| 3 | llama-3.3-70b | **Compliance Reviewer** (DENY path) — explains block + alternatives | `prompt \| llm \| StrOutputParser()` |
-| 4 | llama-3.3-70b | **Trade Strategist** (ALLOW/WARN path) — execution guidance | `prompt \| llm \| StrOutputParser()` |
-| 5 | llama-3.1-8b | **Final Summarizer** — condenses into chat answer | `prompt \| llm \| StrOutputParser()` |
+| Step | Model | Role | Purpose |
+|------|-------|------|---------|
+| 1 | llama-3.3-70b | **Intent Parser** | Extracts Subject/Action/Object/Size using `with_structured_output(TradeIntent)` |
+| 2 | *PeTTa* | **Symbolic Verifier** | Runs recursive 7-check rule engine via subprocess (NOT an LLM) |
+| 3 | llama-3.3-70b | **Adviser** | Unified LLM that explains verdict (DENY/ALLOW/WARN) + guidance |
+| 4 | llama-3.1-8b | **Final Formatter** | Condenses Step 3 into 1-3 sentence You/ACO chat answer |
+
+**For unrelated queries:** Skip to LLM with system prompt asking for direct answer, prefix with `You:` and return immediately.
 
 ---
 
@@ -64,10 +73,10 @@ crypto_aco/
 │   ├── knowledge_base.metta        ← Static rules: taxonomy, limits, thresholds
 │   ├── market_state.metta          ← Dynamic: live prices, sentiment (auto-written)
 │   ├── risk_hierarchy.metta        ← THE BRAIN: recursive 7-check verifier
-│   └── main_logic.metta            ← Public API + pettaSH REPL entry point
+│   └── main_logic.metta            ← Public API + PeTTa REPL entry point
 │
 ├── python/                         ← 20% adapter code
-│   ├── metta_bridge.py             ← pettaSH subprocess runner + S-expr parser
+│   ├── metta_bridge.py             ← PeTTa subprocess runner + S-expr parser
 │   ├── langchain_pipeline.py       ← 5 LangChain LLM calls + ChatLogger
 │   ├── market_feeder.py            ← CoinPaprika + Groq sentiment → MeTTa atoms
 │
@@ -82,7 +91,7 @@ crypto_aco/
 
 ## Setup
 
-### Step 1 — Install pettaSH (MeTTa interpreter)
+### Step 1 — Install PeTTa (MeTTa interpreter)
 ```bash
 # Option A: metta-wam (recommended)
 git clone https://github.com/trueagi-io/metta-wam
@@ -139,8 +148,8 @@ Every request shows all 5 pipeline steps, then the final You/ACO answer:
 │   MeTTa:   (TradeIntent (subject user) (action Buy) ...)
 └───────────────────────────────────────────────────────────┘
 
-┌─ [STEP 2 — MeTTa Symbolic Verifier [pettaSH]] ────────────┐
-│ [SYS] Sending to pettaSH: !(check-trade Buy PEPE 10.0)
+┌─ [STEP 2 — MeTTa Symbolic Verifier [PeTTa]] ────────────┐
+│ [SYS] Sending to PeTTa: !(check-trade Buy PEPE 10.0)
 │ [MeTTa] !(  check-trade Buy PEPE 10.0  )
 │ [MeTTa] ←   (TradeDenied PEPE Buy "RISK CLASS BLOCK...")
 │
@@ -237,14 +246,14 @@ buy 3% ETH                     (if ETH sentiment = Bearish)
 buy some Solana                (if SOL sentiment = Dumping)
 ```
 
-### Market Analysis Questions
+### Market Analysis Questions (Unrelated — Direct LLM Answer)
+These will get raw LLM output with "You:" prefix format:
 ```
-what's the current risk level of my portfolio?
-is it safe to buy BTC right now?
-what's the maximum I can buy of ETH?
-explain why PEPE is blocked
-what assets can I buy with 10%?
-show me the market state
+You: How does cryptocurrency work?
+You: What's the difference between BTC and ETH?
+You: Explain DeFi to me
+You: What's a blockchain?
+You: What are smart contracts?
 ```
 
 ### Complex / Multi-step
@@ -274,12 +283,12 @@ First check that returns `(Denied ...)` short-circuits the chain. All 7 must ret
 
 ---
 
-## pettaSH Direct Testing
+## PeTTa Direct Testing
 
 You can test the MeTTa logic without running Python at all:
 
 ```bash
-# Start pettaSH REPL
+# Start PeTTa REPL
 petta sh metta/main_logic.metta
 
 # Then at the REPL:
@@ -328,7 +337,7 @@ petta sh metta/main_logic.metta
 
 ---
 
-## Why pettaSH + LangChain (not one or the other)
+## Why PeTTa + LangChain (not one or the other)
 
 | Concern | LangChain alone | MeTTa alone | This system |
 |---------|----------------|-------------|-------------|

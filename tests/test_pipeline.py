@@ -1,8 +1,6 @@
 """
 tests/test_pipeline.py
-Run:  python tests/test_pipeline.py
-
-No live pettaSH or Groq API required.
+No live PeTTa or Groq API required.
 All external calls are mocked inside this file.
 """
 
@@ -12,9 +10,7 @@ sys.path.insert(0, os.path.join(_root, "python"))
 sys.path.insert(0, _root)
 
 
-# ============================================================
-# GROUP 1: MeTTa atom format
-# ============================================================
+# GROUP tests
 
 def test_atom_format():
     atoms = [
@@ -36,12 +32,22 @@ def test_atom_format():
         assert atom.startswith("(") and atom.endswith(")"), f"Bad wrap: {atom}"
         parts = atom.strip("()").split()
         assert len(parts) >= 1, f"Empty atom: {atom}"
-    print("OK  test_atom_format: all atoms valid")
 
 
-# ============================================================
-# GROUP 2: pettaSH script builder
-# ============================================================
+def test_extract_concrete_trade_line():
+    """Ground Trade* line must win over AssetRisk and rule templates."""
+    from metta_bridge import MeTTaBridge
+    blob = """
+(TradeApproved $asset $action $pct "template")
+(AssetRisk BTC Layer1 Low)
+(TradeApproved BTC Buy 5.0 "All 9 checks passed.")
+"""
+    ln = MeTTaBridge._extract_concrete_trade_line(blob)
+    assert ln.startswith("(TradeApproved BTC Buy")
+    assert "AssetRisk" not in ln
+
+
+# GROUP tests
 
 def test_script_builder():
     from metta_bridge import MeTTaBridge
@@ -59,7 +65,6 @@ def test_script_builder():
     imp_pos   = script.index("import! &self")
     query_pos = script.index("!(check-trade Buy BTC 5.0)")
     assert imp_pos < query_pos, "imports must precede query"
-    print("OK  test_script_builder")
 
 
 def test_output_filter():
@@ -77,12 +82,9 @@ some noise line
     assert len(lines) == 2
     assert any("TradeApproved" in ln for ln in lines)
     assert any("TradeDenied"   in ln for ln in lines)
-    print("OK  test_output_filter")
 
 
-# ============================================================
-# GROUP 3: S-expression parsers
-# ============================================================
+# GROUP tests
 
 def test_parse_verdict_allow():
     from metta_bridge import MeTTaBridge
@@ -93,7 +95,6 @@ def test_parse_verdict_allow():
     assert v["asset"]   == "BTC"
     assert v["action"]  == "Buy"
     assert "passed" in v["reason"]
-    print("OK  test_parse_verdict_allow")
 
 
 def test_parse_verdict_deny():
@@ -103,7 +104,6 @@ def test_parse_verdict_deny():
     v = b._parse_verdict(raw, "PEPE", "Buy")
     assert v["verdict"] == "Deny"
     assert v["asset"]   == "PEPE"
-    print("OK  test_parse_verdict_deny")
 
 
 def test_parse_verdict_warn():
@@ -112,7 +112,6 @@ def test_parse_verdict_warn():
     raw = '(TradeWarned ETH Buy "Sentiment is unfavourable.")'
     v = b._parse_verdict(raw, "ETH", "Buy")
     assert v["verdict"] == "Warn"
-    print("OK  test_parse_verdict_warn")
 
 
 def test_parse_market_summary():
@@ -123,12 +122,9 @@ def test_parse_market_summary():
     assert d["state"]   == "Normal"
     assert d["balance"] == "10000.00"
     assert "_t" not in d
-    print("OK  test_parse_market_summary")
 
 
-# ============================================================
-# GROUP 4: intent -> MeTTa call mapping
-# ============================================================
+# GROUP tests
 
 def test_intent_metta_call():
     cases = [
@@ -140,7 +136,6 @@ def test_intent_metta_call():
     for action, asset, pct, expected in cases:
         result = f"check-trade {action} {asset} {pct}"
         assert result == expected, f"got: {result}"
-    print("OK  test_intent_metta_call")
 
 
 def test_intent_atom():
@@ -151,16 +146,13 @@ def test_intent_atom():
     assert "action Buy"  in a
     assert "asset BTC"   in a
     assert "size 5.0"    in a
-    print("OK  test_intent_atom")
 
 
-# ============================================================
-# GROUP 5: mock rule engine (mirrors knowledge_base.metta)
-# ============================================================
+# GROUP tests
 
 class MockBridge:
     """
-    Simulates MeTTa verdicts without pettaSH.
+    Simulates MeTTa verdicts without PeTTa.
     Rules mirror knowledge_base.metta exactly including
     the new total-class-exposure and liquidity checks.
     """
@@ -227,7 +219,6 @@ def test_hold_skips_size_cap():
     b = MockBridge()
     v = b.verify_trade("Hold", "BTC", 50.0)
     assert v["verdict"] == "Allow"
-    print("OK  test_hold_skips_size_cap")
 
 
 def test_meme_buy_denied():
@@ -235,21 +226,18 @@ def test_meme_buy_denied():
     v = b.verify_trade("Buy", "PEPE", 10.0)
     assert v["verdict"] == "Deny"
     assert "Critical" in v["reason"]
-    print("OK  test_meme_buy_denied: PEPE Buy blocked")
 
 
 def test_btc_buy_allowed():
     b = MockBridge()
     v = b.verify_trade("Buy", "BTC", 5.0)
     assert v["verdict"] == "Allow"
-    print("OK  test_btc_buy_allowed")
 
 
 def test_oversize_denied():
     b = MockBridge()
     v = b.verify_trade("Buy", "ETH", 50.0)
     assert v["verdict"] == "Deny"
-    print("OK  test_oversize_denied: ETH 50% blocked")
 
 
 def test_sell_critical_allowed():
@@ -257,14 +245,12 @@ def test_sell_critical_allowed():
     b = MockBridge()
     v = b.verify_trade("Sell", "PEPE", 5.0)
     assert v["verdict"] == "Allow"
-    print("OK  test_sell_critical_allowed: Sell PEPE permitted")
 
 
 def test_stablecoin_allowed():
     b = MockBridge()
     v = b.verify_trade("Buy", "USDC", 30.0)
     assert v["verdict"] == "Allow"
-    print("OK  test_stablecoin_allowed")
 
 
 def test_defi_single_cap():
@@ -272,7 +258,6 @@ def test_defi_single_cap():
     b = MockBridge()
     assert b.verify_trade("Buy", "LINK", 6.0)["verdict"] == "Deny"
     assert b.verify_trade("Buy", "LINK", 4.0)["verdict"] == "Allow"
-    print("OK  test_defi_single_cap: 5% cap enforced")
 
 
 def test_total_class_exposure():
@@ -287,12 +272,9 @@ def test_total_class_exposure():
     v_allow = b.verify_trade("Buy", "AAVE", 5.0)
     assert v_deny["verdict"]  == "Deny",  f"expected Deny, got {v_deny}"
     assert v_allow["verdict"] == "Allow", f"expected Allow, got {v_allow}"
-    print("OK  test_total_class_exposure: concentration cap enforced")
 
 
-# ============================================================
-# GROUP 6: sentiment normalization
-# ============================================================
+# GROUP tests
 
 def test_sentiment_norm():
     from constants import SENTIMENT_NORM
@@ -305,7 +287,6 @@ def test_sentiment_norm():
     for word, expected in cases.items():
         got = SENTIMENT_NORM.get(word, "Neutral")
         assert got == expected, f"{word} -> {got} (expected {expected})"
-    print("OK  test_sentiment_norm")
 
 
 def test_sentiment_json_parse():
@@ -336,12 +317,9 @@ def test_sentiment_json_parse():
     r2 = parse("BTC: pumping, ETH: panic", syms)
     assert r2["BTC"] == "Pumping"
     assert r2["ETH"] == "Panic"
-    print("OK  test_sentiment_json_parse")
 
 
-# ============================================================
-# GROUP 7: chat logger
-# ============================================================
+# GROUP tests
 
 def test_chat_logger():
     from chat_logger import ChatLogger
@@ -358,12 +336,9 @@ def test_chat_logger():
     assert "user"      in roles
     assert "assistant" in roles
     assert "metta"     in roles
-    print("OK  test_chat_logger")
 
 
-# ============================================================
-# GROUP 8: new knowledge base atoms validated
-# ============================================================
+# GROUP tests
 
 def test_new_kb_atoms():
     """Verify that the Gemini-suggested atoms are correctly formatted."""
@@ -381,51 +356,8 @@ def test_new_kb_atoms():
         assert atom.startswith("(") and atom.endswith(")"), f"bad: {atom}"
         parts = atom.strip("()").split()
         assert len(parts) >= 2
-    print("OK  test_new_kb_atoms: all Gemini atoms valid")
 
 
 # ============================================================
 # RUN
 # ============================================================
-
-if __name__ == "__main__":
-    print("\n" + "=" * 55)
-    print("  Crypto ACO v3 — Test Suite")
-    print("=" * 55 + "\n")
-
-    print("-- Group 1: MeTTa atom format --")
-    test_atom_format()
-    test_new_kb_atoms()
-
-    print("\n-- Group 2: pettaSH bridge --")
-    test_script_builder()
-    test_output_filter()
-    test_parse_verdict_allow()
-    test_parse_verdict_deny()
-    test_parse_verdict_warn()
-    test_parse_market_summary()
-
-    print("\n-- Group 3: intent mapping --")
-    test_intent_metta_call()
-    test_intent_atom()
-
-    print("\n-- Group 4: mock rule engine (incl. new checks) --")
-    test_meme_buy_denied()
-    test_btc_buy_allowed()
-    test_oversize_denied()
-    test_hold_skips_size_cap()
-    test_sell_critical_allowed()
-    test_stablecoin_allowed()
-    test_defi_single_cap()
-    test_total_class_exposure()
-
-    print("\n-- Group 5: sentiment --")
-    test_sentiment_norm()
-    test_sentiment_json_parse()
-
-    print("\n-- Group 6: chat logger --")
-    test_chat_logger()
-
-    print("\n" + "=" * 55)
-    print("  ALL TESTS PASSED")
-    print("=" * 55 + "\n")

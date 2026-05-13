@@ -1,35 +1,32 @@
 """
-langchain_pipeline.py — The 4-Step LangChain Pipeline (Groq / Llama).
-══════════════════════════════════════════════════════════════════════
-Implements the 4 steps from the assignment using FORMAL LangChain:
+langchain_pipeline.py — 3-LLM ACO Pipeline (Groq / Llama).
 
-  STEP 1 ─ LLM-1: Intent Decomposer
-            ChatGroq → identifies Subject, Action, Object from natural language
-            → structured TradeIntent (Pydantic via with_structured_output)
+Step 1  LLM-1: Intent Parser
+        ChatGroq with_structured_output(TradeIntent)
+        Extracts Subject / Action / Object from natural language.
+        -> TradeIntent (Pydantic)
 
-  STEP 2 ─ MeTTa Verification (NOT an LLM — this is the guardrail)
-            pettaSH subprocess → returns (TradeApproved|TradeDenied|TradeWarned)
+Step 2  MeTTa Symbolic Verifier  [NOT an LLM]
+        PeTTa subprocess runs the 9-check verify-trade chain.
+        -> verdict dict  (Allow | Deny | Warn)
 
-  STEP 3 ─ LLM-2: Risk Analyst
-            ChatGroq → reads the MeTTa verdict + asset context
-            → writes a risk analysis paragraph before final decision
+Step 3  LLM-2: Adviser
+        Single LLM that does both risk analysis AND guidance.
+        DENY  -> explains the block + suggests alternatives.
+        ALLOW -> confirms + gives execution tips.
+        WARN  -> confirms with caution note.
+        Uses MessagesPlaceholder for session memory.
+        -> adviser_response string
 
-  STEP 4a ─ LLM-3: Compliance Reviewer (DENY path)
-            ChatGroq → reviews denied trades and suggests legal alternatives
+Step 4  LLM-3: Final Answer
+        Condenses Step 3 into one clean You/ACO sentence.
+        -> final string shown to user
 
-  STEP 4b ─ LLM-4: Trade Strategist (ALLOW/WARN path)
-            ChatGroq → explains approval, caveats, execution tips
-
-  STEP 5 ─ LLM-5: Final Summarizer
-            ChatGroq → condenses all reasoning into the You/ACO chat answer
-
-All LLM responses are logged step-by-step in chat style.
+Total LLM calls per turn: 3.
 """
 
-import json
-import re
 from datetime import datetime
-from typing import Literal, Optional
+from typing import Literal
 
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -37,449 +34,295 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from langchain_core.output_parsers import StrOutputParser
 from pydantic import BaseModel, Field
 
+from chat_logger import ChatLogger
 
-# ═══════════════════════════════════════════════════════════
+
+# ============================================================
 # PYDANTIC SCHEMA — maps 1:1 to MeTTa atom vocabulary
-# ═══════════════════════════════════════════════════════════
+# ============================================================
 
 class TradeIntent(BaseModel):
     """
-    Structured extraction of a user's trading request.
-    Fields map directly to MeTTa query: check-trade <action> <asset> <size_pct>
+    Structured output from LLM-1.
+    Fields feed directly into the MeTTa query:
+        check-trade <action> <asset> <size_pct>
     """
-    subject:    str = Field(description="Who is making the request. Usually 'user'.")
-    action:     Literal["Buy", "Sell", "Swap", "Hold"] = Field(
-                    description="Trading action. Buy/Sell/Swap/Hold.")
-    asset:      str = Field(description="Crypto ticker symbol in UPPERCASE. E.g. BTC, ETH, SOL.")
-    size_pct:   float = Field(
-                    default=5.0, ge=0.0, le=100.0,
-                    description="Portfolio percentage to trade. Default 5.0.")
-    urgency:    Literal["High", "Normal", "Low"] = Field(
-                    default="Normal",
-                    description="Urgency level. High=FOMO/now, Normal=standard, Low=limit order.")
-    raw_query:  str = Field(description="Original user message verbatim.")
+    subject:   str = Field(description="Who is requesting. Usually 'user'.")
+    action:    Literal["Buy", "Sell", "Swap", "Hold"] = Field(
+                   description="Buy | Sell | Swap | Hold")
+    asset:     str = Field(description="Ticker in UPPERCASE. E.g. BTC, ETH.")
+    size_pct:  float = Field(
+                   default=5.0, ge=0.0, le=100.0,
+                   description="Portfolio percent to trade. Default 5.0.")
+    urgency:   Literal["High", "Normal", "Low"] = Field(
+                   default="Normal",
+                   description="High=FOMO/now. Normal=standard. Low=limit.")
+    raw_query: str = Field(description="Original user message, verbatim.")
 
     def to_metta_call(self) -> str:
         return f"check-trade {self.action} {self.asset} {self.size_pct}"
 
-    def to_metta_atom(self) -> str:
-        return (f"(TradeIntent (subject {self.subject}) (action {self.action})"
-                f" (asset {self.asset}) (size {self.size_pct}) (urgency {self.urgency}))")
+    def to_atom(self) -> str:
+        return (f"(TradeIntent (subject {self.subject})"
+                f" (action {self.action}) (asset {self.asset})"
+                f" (size {self.size_pct}) (urgency {self.urgency}))")
 
-    def normalize(self):
+    def normalize(self) -> "TradeIntent":
         self.asset = self.asset.upper().strip()
         return self
 
 
-from chat_logger import ChatLogger
-
-
-# ═══════════════════════════════════════════════════════════
-# THE PIPELINE
-# ═══════════════════════════════════════════════════════════
+# ============================================================
+# PIPELINE
+# ============================================================
 
 class LangChainACOPipeline:
-    """
-    4-Step neuro-symbolic pipeline with 5 distinct LLM calls.
 
-    Steps:
-      LLM-1  Intent Decomposer  (Groq llama-3.3-70b-versatile)
-      METTA  Symbolic Verifier  (pettaSH subprocess — NOT an LLM)
-      LLM-2  Risk Analyst       (Groq llama-3.3-70b-versatile)
-      LLM-3  Compliance Reviewer OR LLM-4 Trade Strategist (branch)
-      LLM-5  Final Summarizer   (Groq llama-3.1-8b-instant — fast)
-    """
-
-    # Groq model names
-    SMART_MODEL = "llama-3.3-70b-versatile"   # deep reasoning steps
-    FAST_MODEL  = "llama-3.1-8b-instant"       # quick summary step
+    MODEL     = "llama-3.3-70b-versatile"   # Steps 1, 2
+    MODEL_FAST = "llama-3.1-8b-instant"     # Step 3 (final sentence)
 
     def __init__(self, bridge, groq_api_key: str, temperature: float = 0.1):
-        self.bridge = bridge
-        self.log    = ChatLogger()
-        self._key   = groq_api_key
+        self.bridge  = bridge
+        self.log     = ChatLogger()
+        self._llm    = ChatGroq(model=self.MODEL,      api_key=groq_api_key,
+                                temperature=temperature, max_retries=2)
+        self._llm_f  = ChatGroq(model=self.MODEL_FAST, api_key=groq_api_key,
+                                temperature=0.3,         max_retries=2)
+        self._memory: list = []   # LangChain message history for session context
 
-        # LLM-1: Intent decomposer — needs structured output
-        self._llm_smart = ChatGroq(
-            model=self.SMART_MODEL,
-            api_key=groq_api_key,
-            temperature=temperature,
-            max_retries=2,
-        )
-
-        # LLM-5: Fast summarizer
-        self._llm_fast = ChatGroq(
-            model=self.FAST_MODEL,
-            api_key=groq_api_key,
-            temperature=0.3,
-            max_retries=2,
-        )
-
-        # Conversation memory for the session
-        self._session_history: list = []
-
-    # ─────────────────────────────────────────────────────────
-    # MAIN ENTRY — process one user turn
-    # ─────────────────────────────────────────────────────────
+    # --------------------------------------------------------
+    # MAIN ENTRY
+    # --------------------------------------------------------
 
     def process(self, user_message: str) -> str:
-        """
-        Run the full 4-step pipeline for one user message.
-        Returns the final ACO response string.
-        Prints every step as a chat log.
-        """
-        ts = datetime.utcnow().strftime("%H:%M:%S")
-        print(f"\n{'═'*60}")
-        print(f"  🤖  CRYPTO ACO SESSION  ─  {ts} UTC")
-        print(f"{'═'*60}")
+        # Check if query is related to trading (buy/sell/hold/swap)
+        trading_keywords = ["buy", "sell", "hold", "swap"]
+        is_trading_query = any(kw in user_message.lower() for kw in trading_keywords)
+        
+        if not is_trading_query:
+            # For unrelated questions, return raw LLM output with "You:" prefix
+            response = self._llm.invoke([
+                SystemMessage(content="You are a helpful crypto assistant. Answer directly and concisely."),
+                HumanMessage(content=user_message),
+            ])
+            raw_answer = response.content if hasattr(response, 'content') else str(response)
+            final = f"You: {raw_answer}"
+            self._memory.append(HumanMessage(content=user_message))
+            self._memory.append(AIMessage(content=final))
+            return final
+        
+        # For trading queries, run full ACO pipeline
+        ts = datetime.utcnow().strftime("%H:%M:%S UTC")
+        print(f"\n{'=' * 60}\n  CRYPTO ACO  {ts}\n{'=' * 60}")
 
-        # ── STEP 1: Intent Decomposer (LLM-1) ────────────────
-        intent = self._step1_intent(user_message)
+        intent   = self._step1_parse_intent(user_message)
+        verdict  = self._step2_metta_verify(intent)
+        advice   = self._step3_adviser(intent, verdict)
+        final    = self._step4_final_answer(user_message, intent, verdict, advice)
 
-        # ── STEP 2: MeTTa Symbolic Verification ──────────────
-        verdict = self._step2_metta(intent)
-
-        # ── STEP 3: Risk Analyst (LLM-2) ─────────────────────
-        risk_analysis = self._step3_risk_analyst(intent, verdict)
-
-        # ── STEP 4: Branch on verdict (LLM-3 or LLM-4) ───────
-        branch_response = self._step4_branch(intent, verdict, risk_analysis)
-
-        # ── STEP 5: Final Summarizer (LLM-5) → chat answer ───
-        final = self._step5_summarize(user_message, intent, verdict,
-                                       risk_analysis, branch_response)
-
-        # Update session memory
-        self._session_history.append(HumanMessage(content=user_message))
-        self._session_history.append(AIMessage(content=final))
-
-        # Final pretty chat output
-        print(f"\n{'─'*60}")
-        print(f"  You: {user_message}")
-        print(f"  ACO: {final}")
-        print(f"{'─'*60}\n")
-
+        self._memory.append(HumanMessage(content=user_message))
+        self._memory.append(AIMessage(content=final))
+        self.log.final_answer(user_message, final, verdict["verdict"])
         return final
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 1: LLM-1 — Intent Decomposer
-    # ─────────────────────────────────────────────────────────
+    # --------------------------------------------------------
+    # STEP 1:
+    # --------------------------------------------------------
+    # STEP 1: LLM-1 — Intent Parser
+    # --------------------------------------------------------
 
-    def _step1_intent(self, user_message: str) -> TradeIntent:
-        """
-        STEP 1 — LangChain Structured Output.
-        Extracts Subject/Action/Object using with_structured_output + Pydantic.
-        This is the formal LangChain way per the assignment.
-        """
-        self.log.user(
-            user_message,
-            step_label="STEP 1 — Intent Decomposer [LLM-1: llama-3.3-70b]"
-        )
+    def _step1_parse_intent(self, user_message: str) -> TradeIntent:
+        self.log.step_header("STEP 1  Intent Parser  [LLM-1: llama-3.3-70b]")
+        self.log.user_says(user_message)
 
-        # LangChain structured output: LLM fills the Pydantic schema
-        structured_llm = self._llm_smart.with_structured_output(TradeIntent)
-
-        system = SystemMessage(content=INTENT_SYSTEM_PROMPT)
-        human  = HumanMessage(content=f'User message: "{user_message}"')
-        intent: TradeIntent = structured_llm.invoke([system, human])
+        structured = self._llm.with_structured_output(TradeIntent)
+        intent: TradeIntent = structured.invoke([
+            SystemMessage(content=PROMPT_INTENT),
+            HumanMessage(content=f'Parse: "{user_message}"'),
+        ])
         intent.normalize()
 
-        self.log.ai(
-            f"Parsed intent:\n"
-            f"  Subject: {intent.subject}\n"
-            f"  Action:  {intent.action}\n"
-            f"  Asset:   {intent.asset}\n"
-            f"  Size:    {intent.size_pct}%\n"
-            f"  Urgency: {intent.urgency}\n"
-            f"  MeTTa:   {intent.to_metta_atom()}",
-            model_tag="LLM-1 Intent"
+        self.log.llm_says(
+            f"subject={intent.subject}  action={intent.action}  "
+            f"asset={intent.asset}  size={intent.size_pct}%  urgency={intent.urgency}\n"
+            f"metta atom: {intent.to_atom()}",
+            tag="LLM-1"
         )
         return intent
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 2: MeTTa Symbolic Verification (NOT an LLM)
-    # ─────────────────────────────────────────────────────────
+    # --------------------------------------------------------
+    # STEP 2: MeTTa Symbolic Verifier  [NOT an LLM]
+    # --------------------------------------------------------
 
-    def _step2_metta(self, intent: TradeIntent) -> dict:
-        """
-        STEP 2 — The Guardrail (pettaSH).
-        Runs the recursive 7-check verify-trade function.
-        This is the symbolic brain — no LLM involvement.
-        """
-        label = "STEP 2 — MeTTa Symbolic Verifier [pettaSH]"
-        print(f"\n┌─ [{label}] ┐")
+    def _step2_metta_verify(self, intent: TradeIntent) -> dict:
+        self.log.step_header("STEP 2  MeTTa Symbolic Verifier  [PeTTa]")
 
-        metta_call = intent.to_metta_call()
-        self.log.system(f"Sending to pettaSH: !({metta_call})")
-
+        call    = intent.to_metta_call()
         verdict = self.bridge.verify_trade(intent.action, intent.asset, intent.size_pct)
 
-        self.log.metta(metta_call, verdict.get("raw", str(verdict)))
-        self.log.verdict_banner(verdict["verdict"], intent.asset, intent.action)
+        self.log.metta_query(call, verdict.get("raw", str(verdict)))
+        self.log.metta_verdict(verdict["verdict"], intent.asset, intent.action)
+        if verdict.get("reason"):
+            self.log.system_note(f"reason: {verdict['reason']}")
 
-        if verdict["reason"]:
-            self.log.system(f"Reason: {verdict['reason']}")
-
-        print(f"└{'─'*59}┘")
         return verdict
 
-    # ─────────────────────────────────────────────────────────
-    # STEP 3: LLM-2 — Risk Analyst
-    # ─────────────────────────────────────────────────────────
+    # --------------------------------------------------------
+    # STEP 3: LLM-2 — Adviser (risk analysis + guidance combined)
+    # --------------------------------------------------------
 
-    def _step3_risk_analyst(self, intent: TradeIntent, verdict: dict) -> str:
+    def _step3_adviser(self, intent: TradeIntent, verdict: dict) -> str:
         """
-        STEP 3 — Risk Analyst LLM.
-        Reads the MeTTa verdict + market context.
-        Writes a structured risk analysis (1 paragraph).
-        This is a separate LangChain chain: prompt | llm | parser.
+        Single LLM that handles both paths:
+        - DENY  : explain block + suggest alternatives
+        - ALLOW : confirm + execution tips
+        - WARN  : confirm with caution
+        Uses session memory via MessagesPlaceholder.
         """
-        self.log.user(
-            f"Analyze risk for: {intent.action} {intent.asset} "
-            f"({intent.size_pct}%) | MeTTa: {verdict['verdict']} | "
-            f"Reason: {verdict.get('reason','none')}",
-            step_label="STEP 3 — Risk Analyst [LLM-2: llama-3.3-70b]"
-        )
+        self.log.step_header("STEP 3  Adviser  [LLM-2: llama-3.3-70b]")
 
-        # Build market context from bridge
         asset_data = self.bridge.asset_info(intent.asset)
         mkt        = self.bridge.market_summary()
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", RISK_ANALYST_SYSTEM),
-            ("human",  RISK_ANALYST_HUMAN),
+            ("system", PROMPT_ADVISER_SYSTEM),
+            MessagesPlaceholder("history"),
+            ("human", PROMPT_ADVISER_HUMAN),
         ])
-        chain = prompt | self._llm_smart | StrOutputParser()
+        chain  = prompt | self._llm | StrOutputParser()
 
-        analysis = chain.invoke({
+        response = chain.invoke({
             "action":       intent.action,
             "asset":        intent.asset,
             "size_pct":     intent.size_pct,
+            "urgency":      intent.urgency,
             "verdict":      verdict["verdict"],
             "metta_reason": verdict.get("reason", "N/A"),
             "asset_class":  asset_data.get("class", "Unknown"),
-            "risk_level":   asset_data.get("risk", "Unknown"),
+            "risk_level":   asset_data.get("risk",  "Unknown"),
             "price":        asset_data.get("price", "N/A"),
             "volatility":   asset_data.get("volatility", "N/A"),
-            "sentiment":    asset_data.get("sentiment", "N/A"),
-            "market_state": mkt.get("state", "N/A"),
+            "sentiment":    asset_data.get("sentiment",  "N/A"),
+            "trend":        asset_data.get("trend",      "N/A"),
+            "market_state": mkt.get("state",     "N/A"),
             "daily_pnl":    mkt.get("daily_pnl", "N/A"),
+            "history":      self._memory[-4:],   # last 2 turns for context
         })
 
-        self.log.ai(analysis, model_tag="LLM-2 Risk")
-        return analysis
-
-    # ─────────────────────────────────────────────────────────
-    # STEP 4: LLM-3 or LLM-4 — Compliance Reviewer / Strategist
-    # ─────────────────────────────────────────────────────────
-
-    def _step4_branch(
-        self, intent: TradeIntent, verdict: dict, risk_analysis: str
-    ) -> str:
-        """
-        STEP 4 — Branching based on MeTTa verdict.
-
-        DENY/ERROR path → LLM-3: Compliance Reviewer
-          Explains WHY it was blocked and suggests alternatives.
-
-        ALLOW/WARN path → LLM-4: Trade Strategist
-          Confirms the trade and provides execution guidance.
-
-        Both are full LangChain chains with session memory context.
-        """
-        v = verdict["verdict"]
-
-        if v in ("Deny", "Error"):
-            return self._step4a_compliance_reviewer(intent, verdict, risk_analysis)
-        else:
-            return self._step4b_trade_strategist(intent, verdict, risk_analysis)
-
-    def _step4a_compliance_reviewer(
-        self, intent: TradeIntent, verdict: dict, risk_analysis: str
-    ) -> str:
-        """LLM-3: Compliance Reviewer (DENY path)."""
-        self.log.user(
-            f"DENIED: {intent.action} {intent.asset}. Reason: {verdict.get('reason','')}",
-            step_label="STEP 4a — Compliance Reviewer [LLM-3: llama-3.3-70b]"
-        )
-
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", COMPLIANCE_REVIEWER_SYSTEM),
-            MessagesPlaceholder("history"),
-            ("human",  COMPLIANCE_REVIEWER_HUMAN),
-        ])
-        chain = prompt | self._llm_smart | StrOutputParser()
-
-        response = chain.invoke({
-            "action":       intent.action,
-            "asset":        intent.asset,
-            "size_pct":     intent.size_pct,
-            "metta_reason": verdict.get("reason", "Compliance rule violation."),
-            "raw_verdict":  verdict.get("raw", ""),
-            "risk_analysis": risk_analysis,
-            "history":      self._session_history[-4:],  # last 2 turns context
-        })
-
-        self.log.ai(response, model_tag="LLM-3 Compliance")
+        self.log.llm_says(response, tag="LLM-2")
         return response
 
-    def _step4b_trade_strategist(
-        self, intent: TradeIntent, verdict: dict, risk_analysis: str
-    ) -> str:
-        """LLM-4: Trade Strategist (ALLOW/WARN path)."""
-        label = ("STEP 4b — Trade Strategist [LLM-4: llama-3.3-70b]"
-                 + (" ⚠️  WITH WARNING" if verdict["verdict"] == "Warn" else ""))
-        self.log.user(
-            f"{verdict['verdict']}: {intent.action} {intent.asset} "
-            f"({intent.size_pct}%). Providing strategy.",
-            step_label=label
-        )
+    # --------------------------------------------------------
+    # STEP 4: LLM-3 — Final Answer (1-2 sentences for the user)
+    # --------------------------------------------------------
 
-        prompt = ChatPromptTemplate.from_messages([
-            ("system", TRADE_STRATEGIST_SYSTEM),
-            MessagesPlaceholder("history"),
-            ("human",  TRADE_STRATEGIST_HUMAN),
-        ])
-        chain = prompt | self._llm_smart | StrOutputParser()
-
-        response = chain.invoke({
-            "action":       intent.action,
-            "asset":        intent.asset,
-            "size_pct":     intent.size_pct,
-            "verdict":      verdict["verdict"],
-            "metta_reason": verdict.get("reason", ""),
-            "risk_analysis": risk_analysis,
-            "urgency":      intent.urgency,
-            "history":      self._session_history[-4:],
-        })
-
-        self.log.ai(response, model_tag="LLM-4 Strategy")
-        return response
-
-    # ─────────────────────────────────────────────────────────
-    # STEP 5: LLM-5 — Final Summarizer
-    # ─────────────────────────────────────────────────────────
-
-    def _step5_summarize(
+    def _step4_final_answer(
         self,
         user_message: str,
         intent: TradeIntent,
         verdict: dict,
-        risk_analysis: str,
-        branch_response: str,
+        advice: str,
     ) -> str:
-        """
-        STEP 5 — Final Summarizer.
-        Condenses all reasoning into a single crisp You/ACO response.
-        Uses the fast llama-3.1-8b-instant model.
-        """
-        self.log.user(
-            "Synthesize final response for user.",
-            step_label="STEP 5 — Final Summarizer [LLM-5: llama-3.1-8b]"
-        )
+        self.log.step_header("STEP 4  Final Answer  [LLM-3: llama-3.1-8b]")
 
         prompt = ChatPromptTemplate.from_messages([
-            ("system", SUMMARIZER_SYSTEM),
-            ("human",  SUMMARIZER_HUMAN),
+            ("system", PROMPT_FINAL_SYSTEM),
+            ("human",  PROMPT_FINAL_HUMAN),
         ])
-        chain = prompt | self._llm_fast | StrOutputParser()
+        chain  = prompt | self._llm_f | StrOutputParser()
 
-        summary = chain.invoke({
-            "user_message":    user_message,
-            "verdict":         verdict["verdict"],
-            "asset":           intent.asset,
-            "action":          intent.action,
-            "size_pct":        intent.size_pct,
-            "metta_reason":    verdict.get("reason", ""),
-            "risk_analysis":   risk_analysis[:500],   # truncate for token budget
-            "branch_response": branch_response[:800],
+        final = chain.invoke({
+            "user_message": user_message,
+            "verdict":      verdict["verdict"],
+            "asset":        intent.asset,
+            "action":       intent.action,
+            "metta_reason": verdict.get("reason", ""),
+            "advice":       advice[:600],
         })
 
-        self.log.ai(summary, model_tag="LLM-5 Final")
-        return summary
+        self.log.llm_says(final, tag="LLM-3")
+        return final
 
-    # ─────────────────────────────────────────────────────────
-    # AUDIT + HISTORY
-    # ─────────────────────────────────────────────────────────
+    # --------------------------------------------------------
+    # HISTORY
+    # --------------------------------------------------------
 
     def get_chat_history(self) -> list[dict]:
         return self.log.export()
 
     def get_session_memory(self) -> list:
-        return list(self._session_history)
+        return list(self._memory)
 
 
-# ═══════════════════════════════════════════════════════════
+# ============================================================
 # PROMPT TEMPLATES
-# Keep these OUTSIDE the class to stay readable and editable.
-# ═══════════════════════════════════════════════════════════
+# Kept outside the class so they are easy to read and edit.
+# ============================================================
 
-# ── LLM-1: Intent Decomposer ─────────────────────────────────
-INTENT_SYSTEM_PROMPT = """You are a trade intent parser for a crypto trading compliance system.
-Extract the Subject (who), Action (Buy/Sell/Swap/Hold), and Object (asset ticker) from the user's message.
+# LLM-1: Intent Parser
+PROMPT_INTENT = """\
+You are a trade intent parser for a crypto compliance system.
+Extract Subject, Action, and Object from the user's message.
 
-Known asset tickers: BTC, ETH, SOL, ADA, AVAX, MATIC, ARB, OP, LINK, UNI, AAVE, USDT, USDC, DOGE, SHIB, PEPE
+Known tickers: BTC ETH SOL ADA AVAX MATIC ARB OP LINK UNI AAVE USDT USDC DOGE SHIB PEPE
 
-Mapping rules:
-- action: buying/long/get in/acquire → Buy | selling/exit/dump → Sell | converting/swap → Swap | holding/HODL → Hold
-- asset: "Bitcoin" → BTC, "Ethereum" → ETH, "Solana" → SOL, "Dogecoin" → DOGE. Unknown coin → UNKNOWN.
-- size_pct: "all in" → 50.0 | "half" → 25.0 | "small" → 2.0 | "10%" → 10.0 | unspecified → 5.0
-- urgency: FOMO/now/asap/immediately → High | default → Normal
-- subject: always "user" unless specified otherwise
+Rules:
+- action  : buy/long/acquire -> Buy | sell/exit/dump -> Sell | swap/convert -> Swap | hold/hodl -> Hold
+- asset   : "Bitcoin" -> BTC, "Ethereum" -> ETH, "Solana" -> SOL, "Dogecoin" -> DOGE, unknown -> UNKNOWN
+- size_pct: "all in" -> 50.0 | "half" -> 25.0 | "small" -> 2.0 | "10%" -> 10.0 | not stated -> 5.0
+- urgency : fomo/now/asap -> High | default -> Normal
+- subject : always "user" unless stated otherwise
 
-Return the structured TradeIntent object."""
+Return the TradeIntent object.\
+"""
 
+# LLM-2: Adviser (handles DENY and ALLOW/WARN in one prompt)
+PROMPT_ADVISER_SYSTEM = """\
+You are the ACO (Algorithmic Compliance Officer) adviser.
+The MeTTa symbolic engine has already made the decision. Your job is to explain it.
 
-# ── LLM-2: Risk Analyst ──────────────────────────────────────
-RISK_ANALYST_SYSTEM = """You are a senior crypto risk analyst. Analyze the proposed trade and the MeTTa 
-compliance engine's verdict. Be concise, factual, and objective. 2-3 sentences maximum."""
+If verdict is DENY  : explain clearly which rule blocked the trade and suggest 1-2 alternatives.
+If verdict is ALLOW : confirm approval and give 1-2 practical execution tips.
+If verdict is WARN  : confirm approval but explain the caution clearly.
 
-RISK_ANALYST_HUMAN = """Trade request: {action} {asset} ({size_pct}% of portfolio)
-MeTTa verdict: {verdict} | Reason: {metta_reason}
-Asset class: {asset_class} | Risk tier: {risk_level}
-Current price: ${price} | Volatility: {volatility}% | Sentiment: {sentiment}
-Market state: {market_state} | Daily PnL: {daily_pnl}%
+The MeTTa verdict is exactly one of: Allow | Deny | Warn. The asset risk tier (e.g. Low) describes how risky the asset class is, not whether the trade was denied—never treat "Low" tier as a denial by itself.
 
-Write a 2-3 sentence risk assessment of this trade, explaining the key risk factors."""
+Rules:
+- Never override the MeTTa decision.
+- Be concise: 3-5 sentences.
+- No bullet points. Plain prose.
+- Do not repeat the verdict icon — the final formatter will add it.\
+"""
 
-# ── LLM-3: Compliance Reviewer (DENY path) ───────────────────
-COMPLIANCE_REVIEWER_SYSTEM = """You are the ACO (Algorithmic Compliance Officer). 
-A trade has been DENIED by the MeTTa symbolic risk engine. Your job is to:
-1. Explain clearly WHY the trade was blocked (reference the specific rule).
-2. Suggest 1-2 concrete LEGAL alternatives the user could do instead.
-3. Be firm but helpful. Never override the denial. 3-4 sentences."""
+PROMPT_ADVISER_HUMAN = """\
+Trade : {action} {asset} ({size_pct}% of portfolio)  urgency={urgency}
+MeTTa verdict : {verdict}
+MeTTa reason  : {metta_reason}
+Asset class   : {asset_class}  risk tier : {risk_level}
+Price $: {price}  volatility: {volatility}%  sentiment: {sentiment}  trend: {trend}
+Market state  : {market_state}  daily PnL: {daily_pnl}%
 
-COMPLIANCE_REVIEWER_HUMAN = """DENIED trade: {action} {asset} ({size_pct}%)
-MeTTa denial reason: {metta_reason}
-Raw MeTTa atom: {raw_verdict}
-Risk analysis: {risk_analysis}
+Write your adviser response.\
+"""
 
-Explain the denial and suggest alternatives. Remember: the denial is FINAL."""
+# LLM-3: Final Answer
+PROMPT_FINAL_SYSTEM = """\
+You are the final voice of the ACO system.
+Condense the adviser's response into 1-3 clear sentences the user will read directly.
 
-# ── LLM-4: Trade Strategist (ALLOW/WARN path) ────────────────
-TRADE_STRATEGIST_SYSTEM = """You are a crypto trade strategist. A trade has been APPROVED 
-(or approved with a WARNING) by the MeTTa compliance engine. Your job is to:
-1. Confirm the approval and state any warnings clearly.
-2. Give 1-2 practical execution tips (timing, order type, etc.).
-3. Keep it professional. 3-4 sentences."""
+Verdict icons to START with (use only one):
+  ALLOW -> [APPROVED]
+  DENY  -> [DENIED]
+  WARN  -> [WARNING]
 
-TRADE_STRATEGIST_HUMAN = """APPROVED trade ({verdict}): {action} {asset} ({size_pct}%)
-MeTTa note: {metta_reason}
-Risk analysis: {risk_analysis}
-Urgency level: {urgency}
+No additional formatting. Plain sentences only.\
+"""
 
-Confirm the trade approval and provide execution guidance."""
+PROMPT_FINAL_HUMAN = """\
+User asked : "{user_message}"
+MeTTa verdict : {verdict} on {action} {asset}
+MeTTa reason  : {metta_reason}
+Adviser guidance : {advice}
 
-# ── LLM-5: Final Summarizer ──────────────────────────────────
-SUMMARIZER_SYSTEM = """You are the final voice of the Crypto ACO system. Synthesize all analysis 
-into ONE clear response the user will see. Format: 2-4 sentences. Start with the verdict icon:
-✅ (approved) | 🚫 (denied) | ⚠️ (approved with warning). Be direct and informative."""
-
-SUMMARIZER_HUMAN = """User asked: "{user_message}"
-
-MeTTa verdict: {verdict} on {action} {asset} ({size_pct}%)
-MeTTa reason: {metta_reason}
-Risk analysis summary: {risk_analysis}
-Detailed guidance: {branch_response}
-
-Write the final 2-4 sentence ACO response. Start with the verdict icon."""
+Write the final 1-3 sentence response starting with the verdict icon.\
+"""

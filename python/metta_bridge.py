@@ -1,19 +1,13 @@
 """
-metta_bridge.py — pettaSH subprocess adapter for the MeTTa AtomSpace.
-═══════════════════════════════════════════════════════════════════════
-Uses petta (via `petta sh <script.metta>`) as the MeTTa interpreter.
-Python communicates with petta through temp files + stdout capture.
+metta_bridge.py
+PeTTa subprocess adapter for the MeTTa AtomSpace.
 
-Why subprocess instead of `from hyperon import MeTTa`:
-  - User runs petta as their MeTTa interpreter (pettaSH)
-  - No Python package needed: `petta sh` handles everything
-  - Fresh process per query = no stale AtomSpace state
-  - market_state.metta is re-read from disk each time → always live
+Responsibilities (all Python does here):
+  1. Build a composite .metta script: imports + query expression.
+  2. Run  petta sh <tmp_script>  and capture stdout.
+  3. Parse the S-expression result into a Python dict.
 
-This file does ONLY 3 things:
-  1. Build a composite .metta script per query (imports + expression)
-  2. Spawn `petta sh <script>`, capture stdout
-  3. Parse S-expression output → Python dict (regex, no logic)
+Zero trade logic lives here. All decisions are in .metta files.
 """
 
 import re
@@ -23,20 +17,25 @@ import os
 from pathlib import Path
 from typing import Any
 
-
-# ── S-expression parsing helpers ──────────────────────────────
 _QUOTED_RE = re.compile(r'"([^"]*)"')
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+# Concrete PeTTa result (not a rule template with $metavars).
+_CONCRETE_TRADE_LINE = re.compile(
+    r"^\(Trade(?:Approved|Denied|Warned)\s+"
+    r"(?P<asset>[A-Z][A-Z0-9]*)\s+"
+    r"(?P<action>Buy|Sell|Swap|Hold)\s+"
+)
 
 
 class MeTTaBridge:
     """
-    pettaSH-based MeTTa runner.
+    Runs MeTTa queries via PeTTa subprocess.
 
     Args:
-        metta_dir: directory containing the .metta files
-        petta_cmd: shell command for petta (default: "petta")
-                   Override if petta is not on PATH:
-                   MeTTaBridge(petta_cmd="/usr/local/bin/petta")
+        metta_dir : folder containing knowledge_base, market_state, risk_hierarchy
+                    (main_logic.metta is optional documentation only)
+        petta_cmd : shell command for petta  (default: "petta")
+                    Override with env var PETTA_CMD or pass directly.
     """
 
     def __init__(self, metta_dir: str = "metta", petta_cmd: str = "petta"):
@@ -47,84 +46,94 @@ class MeTTaBridge:
         self._rh = self.metta_dir / "risk_hierarchy.metta"
         self._ml = self.metta_dir / "main_logic.metta"
 
-    # ─────────────────────────────────────────────────────────
-    # PUBLIC API — used by LangChain pipeline
-    # ─────────────────────────────────────────────────────────
+    # --- public API ------------------------------------------
 
     def verify_trade(self, action: str, asset: str, size_pct: float) -> dict[str, Any]:
-        """Ask MeTTa: is this trade allowed? Returns verdict dict."""
-        raw = self._run("!(check-trade {action} {asset} {pct})".format(
-            action=action, asset=asset, pct=size_pct))
-        return self._parse_verdict(raw, asset, action) if raw else {
-            "verdict": "Error", "reason": "pettaSH returned no output.",
-            "asset": asset, "action": action, "raw": ""}
+        """Main guardrail query. Returns a verdict dict."""
+        query = f"!(check-trade {action} {asset} {size_pct})"
+        blob = self._petta_stdout(query)
+        if not blob.strip():
+            return {"verdict": "Error", "asset": asset, "action": action,
+                    "reason": "PeTTa returned no output.", "raw": ""}
+        if "PeTTa-timeout" in blob or "(Error" in blob:
+            return {
+                "verdict": "Error",
+                "asset": asset,
+                "action": action,
+                "reason": "PeTTa subprocess timed out or reported an error.",
+                "raw": blob[:2000],
+            }
+        raw = self._extract_concrete_trade_line(blob)
+        if not raw:
+            return {
+                "verdict": "Error",
+                "asset": asset,
+                "action": action,
+                "reason": "PeTTa output had no concrete Trade* verdict line (check petta logs).",
+                "raw": blob[:2000],
+            }
+        return self._parse_verdict(raw, asset, action)
 
     def asset_info(self, asset: str) -> dict[str, Any]:
         raw = self._run(f"!(asset-info {asset})")
-        return self._parse_asset_info(raw) if raw else {"error": f"Unknown asset: {asset}"}
+        return self._parse_asset_info(raw) if raw else {"error": f"Unknown: {asset}"}
 
     def market_summary(self) -> dict[str, Any]:
         raw = self._run("!(market-summary)")
         return self._parse_market_summary(raw) if raw else {
-            "state": "Unknown", "balance": "?", "daily_pnl": "?", "trades_this_hour": "?"}
+            "state": "Unknown", "balance": "?", "daily_pnl": "?",
+            "trades_this_hour": "?"}
 
     def portfolio_risk(self) -> list[dict]:
         lines = self._run_multi("!(portfolio-risk)")
         return [self._parse_asset_risk(ln) for ln in lines if ln.strip()]
 
     def update_market_state(self, atoms: list[str]) -> None:
-        """
-        Overwrite market_state.metta with fresh atoms from the feeder.
-        pettaSH re-reads from disk on each query, so this is always live.
-        """
-        header = "; AUTO-GENERATED by market_feeder.py — do not edit\n\n"
-        self._ms.write_text(header + "\n".join(atoms) + "\n")
+        """Overwrite market_state.metta. PeTTa reads it fresh each query."""
+        self._ms.write_text(
+            "; AUTO-GENERATED by market_feeder.py\n\n" + "\n".join(atoms) + "\n"
+        )
 
     def ping(self) -> tuple[bool, str]:
-        """Check pettaSH availability and .metta file presence."""
+        """Check PeTTa availability and file presence."""
         try:
             r = subprocess.run(
                 [self.petta_cmd, "--version"],
-                capture_output=True, text=True, timeout=5)
+                capture_output=True, text=True, timeout=5
+            )
             files_ok = all(p.exists() for p in [self._kb, self._ms, self._rh])
-            msg = f"petta OK (exit {r.returncode}), files {'OK' if files_ok else 'MISSING'}"
-            return r.returncode == 0 and files_ok, msg
+            ok  = (r.returncode == 0) and files_ok
+            msg = f"petta exit={r.returncode}, files={'OK' if files_ok else 'MISSING'}"
+            return ok, msg
         except FileNotFoundError:
             return False, f"'{self.petta_cmd}' not found in PATH"
         except Exception as e:
             return False, str(e)
 
-    # ─────────────────────────────────────────────────────────
-    # SUBPROCESS CORE
-    # ─────────────────────────────────────────────────────────
+    # --- script builder --------------------------------------
 
     def _build_script(self, query: str) -> str:
         """
-        Build a self-contained .metta script:
-          1. Import knowledge base (static rules, never changes)
-          2. Import market state (live data, rewritten each poll)
-          3. Import risk hierarchy (logic engine)
-          4. Import main logic (API functions)
-          5. Execute the query expression
-        pettaSH evaluates top-to-bottom, so imports define context.
+        Composite script: import all knowledge, then run query.
+        PeTTa evaluates top-to-bottom, so imports must come first.
         """
         return (
-            f'; pettaSH auto-generated runner script\n'
+            '; PeTTa auto-generated runner\n'
             f'!(import! &self "{self._kb}")\n'
             f'!(import! &self "{self._ms}")\n'
             f'!(import! &self "{self._rh}")\n'
-            f'!(import! &self "{self._ml}")\n'
             f'{query}\n'
         )
 
+    # --- subprocess runner -----------------------------------
+
     def _run(self, query: str) -> str:
-        """Run one MeTTa query, return first result line."""
         lines = self._run_multi(query)
         return lines[0] if lines else ""
 
-    def _run_multi(self, query: str) -> list[str]:
-        """Run a MeTTa query, return all result lines (for multi-atom results)."""
-        script = self._build_script(query)
+    def _petta_stdout(self, query: str) -> str:
+        """Run the composite script and return raw stdout+stderr text."""
+        script   = self._build_script(query)
         tmp_path = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -133,59 +142,95 @@ class MeTTaBridge:
                 f.write(script)
                 tmp_path = f.name
 
-            result = subprocess.run(
-                [self.petta_cmd, "sh", tmp_path],
-                capture_output=True, text=True, timeout=30
-            )
-            # pettaSH may use stdout or stderr depending on version
-            output = result.stdout.strip() or result.stderr.strip()
-            return self._filter_output(output)
+            out_path = tmp_path + ".out"
+            timeout_s = int(os.getenv("PETTA_TIMEOUT", "90"))
+            try:
+                with open(out_path, "w", encoding="utf-8", errors="replace") as out_f:
+                    subprocess.run(
+                        [self.petta_cmd, "sh", tmp_path],
+                        stdout=out_f,
+                        stderr=subprocess.STDOUT,
+                        timeout=timeout_s,
+                        check=False,
+                    )
+                output = Path(out_path).read_text(encoding="utf-8", errors="replace")
+            finally:
+                if os.path.exists(out_path):
+                    os.unlink(out_path)
+
+            return output.strip()
 
         except FileNotFoundError:
             raise RuntimeError(
-                f"\n[MeTTaBridge] ERROR: '{self.petta_cmd}' not found.\n"
-                "Install petta: https://github.com/trueagi-io/metta-wam\n"
-                "Then run: petta sh <file.metta>\n"
+                f"PeTTa not found: '{self.petta_cmd}'\n"
+                "Install: https://github.com/trueagi-io/metta-wam\n"
+                "Or set PETTA_CMD env var to the full path."
             )
         except subprocess.TimeoutExpired:
-            return [f"(Error pettaSH-timeout)"]
+            return "(Error PeTTa-timeout)"
         finally:
             if tmp_path and os.path.exists(tmp_path):
                 os.unlink(tmp_path)
 
+    def _run_multi(self, query: str) -> list[str]:
+        output = self._petta_stdout(query)
+        if output.startswith("(Error"):
+            return [output]
+        return self._filter_output(output)
+
+    @staticmethod
+    def _extract_concrete_trade_line(blob: str) -> str:
+        """
+        PeTTa prints many '(Trade...' rule templates with $metavars and mixes in
+        '(AssetRisk ...)' lines. Only a line matching a *ground* verdict counts.
+        Scan bottom-up so the real evaluation result wins over earlier noise.
+        """
+        text = _ANSI_RE.sub("", blob)
+        for line in reversed(text.splitlines()):
+            s = line.strip()
+            if not s or "$" in s:
+                continue
+            if _CONCRETE_TRADE_LINE.match(s):
+                return s
+        return ""
+
     def _filter_output(self, raw: str) -> list[str]:
-        """Keep only lines that look like MeTTa atom results."""
+        """Keep only lines that are MeTTa result atoms."""
+        raw = _ANSI_RE.sub("", raw)
+        result_atoms = {
+            "TradeApproved", "TradeDenied", "TradeWarned",
+            "AssetInfo", "MarketSummary", "AssetRisk"
+        }
         good = []
         for line in raw.splitlines():
             line = line.strip()
             if not line:
                 continue
-            # Specifically look for TradeApproved, TradeDenied, TradeWarned, AssetInfo, MarketSummary, AssetRisk
-            if any(pattern in line for pattern in ["TradeApproved", "TradeDenied", "TradeWarned", "AssetInfo", "MarketSummary", "AssetRisk"]):
+            if any(atom in line for atom in result_atoms):
                 good.append(line)
-        return good
+        trade = [
+            ln for ln in good
+            if ln.startswith("(TradeApproved")
+            or ln.startswith("(TradeDenied")
+            or ln.startswith("(TradeWarned")
+        ]
+        rest = [ln for ln in good if ln not in trade]
+        return trade + rest
 
-    # ─────────────────────────────────────────────────────────
-    # S-EXPRESSION PARSERS  (format only, zero logic)
-    # ─────────────────────────────────────────────────────────
+    # --- S-expression parsers --------------------------------
+    # Pure format converters. No logic.
 
     def _parse_verdict(self, atom_str: str, asset: str, action: str) -> dict:
-        """Parse pettaSH verdict atom → Python dict."""
-        inner = atom_str.strip()
-        if inner.startswith("(") and inner.endswith(")"):
-            inner = inner[1:-1]
-
+        inner    = atom_str.strip().strip("()")
         reason_m = _QUOTED_RE.search(inner)
         reason   = reason_m.group(1) if reason_m else ""
-        clean    = _QUOTED_RE.sub("", inner)
-        tokens   = clean.split()
+        clean    = _QUOTED_RE.sub("", inner).split()
 
-        verdict_type = tokens[0] if tokens else "Unknown"
-        v_asset  = tokens[1] if len(tokens) > 1 else asset
-        v_action = tokens[2] if len(tokens) > 2 else action
-
-        if not reason and len(tokens) > 3:
-            reason = " ".join(tokens[3:])
+        vtype    = clean[0] if clean else "Unknown"
+        v_asset  = clean[1] if len(clean) > 1 else asset
+        v_action = clean[2] if len(clean) > 2 else action
+        if not reason and len(clean) > 3:
+            reason = " ".join(clean[3:])
 
         verdict_map = {
             "TradeApproved": "Allow",
@@ -193,30 +238,30 @@ class MeTTaBridge:
             "TradeWarned":   "Warn",
         }
         return {
-            "verdict": verdict_map.get(verdict_type, verdict_type),
+            "verdict": verdict_map.get(vtype, vtype),
             "asset":   v_asset,
             "action":  v_action,
             "reason":  reason.strip(),
             "raw":     atom_str,
         }
 
-    def _parse_asset_info(self, atom_str: str) -> dict:
-        tokens = atom_str.strip("()").split()
-        keys = ["_type","asset","class","risk","max_pct","price","volatility","sentiment","trend"]
+    def _parse_asset_info(self, s: str) -> dict:
+        tokens = s.strip("()").split()
+        keys   = ["_t","asset","class","risk","max_pct","price","volatility","sentiment","trend"]
         d = dict(zip(keys, tokens))
-        d.pop("_type", None)
+        d.pop("_t", None)
         return d
 
-    def _parse_market_summary(self, atom_str: str) -> dict:
-        tokens = atom_str.strip("()").split()
-        keys = ["_type","state","balance","daily_pnl","trades_this_hour"]
+    def _parse_market_summary(self, s: str) -> dict:
+        tokens = s.strip("()").split()
+        keys   = ["_t","state","balance","daily_pnl","trades_this_hour"]
         d = dict(zip(keys, tokens))
-        d.pop("_type", None)
+        d.pop("_t", None)
         return d
 
-    def _parse_asset_risk(self, atom_str: str) -> dict:
-        tokens = atom_str.strip("()").split()
-        keys = ["_type","asset","class","risk_level"]
+    def _parse_asset_risk(self, s: str) -> dict:
+        tokens = s.strip("()").split()
+        keys   = ["_t","asset","class","risk_level"]
         d = dict(zip(keys, tokens))
-        d.pop("_type", None)
+        d.pop("_t", None)
         return d
