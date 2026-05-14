@@ -1,8 +1,39 @@
 # Crypto ACO — Algorithmic Compliance Officer
+
+**Executive Summary**
+
+**Crypto ACO — Algorithmic Compliance Officer**  
 **MeTTa + LangChain + Groq — Neuro-Symbolic Trading Guardrail**
 
-Separates **trading requests** (full 4-step pipeline with symbolic verification) from **unrelated questions** (direct LLM answer).
+The **MeTTa-LangChain** project implements a robust **Algorithmic Compliance Officer (ACO)** for cryptocurrency trading. It combines the strengths of large language models with deterministic symbolic reasoning to create a reliable, auditable trading guardrail system.
 
+### Objective
+To build a production-grade neuro-symbolic system that safely interprets natural language trading requests, enforces strict risk and compliance rules using symbolic logic (MeTTa), and provides clear explanations — while maintaining the flexibility of LLMs for general conversation.
+
+### Core Innovation
+The system intelligently separates concerns:
+- **Trading intents** undergo a full **4-step pipeline**:
+  1. Intent Parsing (LLM)
+  2. Symbolic Verification — 9 deterministic risk checks (MeTTa, no LLM)
+  3. Risk Explanation (LLM)
+  4. Concise User Summary (LLM)
+- **Unrelated/general questions** are routed directly to the LLM for fast responses.
+
+### Key Features
+- **9 Symbolic Risk Checks** (circuit-breaker, daily loss limits, position sizing, liquidity, asset risk tiers, sentiment divergence, etc.)
+- Transparent and auditable decisions (fully explainable symbolic layer)
+- Live market state integration
+- Interactive REPL with portfolio snapshot, audit logs, and direct MeTTa testing
+- Easy extensibility through MeTTa knowledge atoms
+
+### Technology Stack
+- **Symbolic Engine**: MeTTa / PeTTa (deterministic hypergraph reasoning)
+- **LLM Orchestration**: LangChain + Groq (Llama-3.3-70B)
+- **Bridge**: Python subprocess communication
+
+This hybrid architecture delivers the natural language fluency of modern LLMs together with the reliability, speed, and auditability required for real trading compliance — overcoming the hallucination and opacity problems of pure LLM systems.
+
+Ideal for algorithmic traders, DeFi protocols, or any application requiring trustworthy AI-mediated financial actions.
 
 ### Prerequisites
 - Python 3.10+
