@@ -3,19 +3,16 @@
 
 Separates **trading requests** (full 4-step pipeline with symbolic verification) from **unrelated questions** (direct LLM answer).
 
----
-
-## Quick Start
 
 ### Prerequisites
 - Python 3.10+
-- Symbolic interpreter (metta-wam) + GROQ_API_KEY
+- Symbolic interpreter (PeTTa) + GROQ_API_KEY
 
 ### Setup (5 Steps)
 
 **1. Install symbolic interpreter**
 ```bash
-git clone https://github.com/trueagi-io/metta-wam
+git clone https://github.com/trueagi-io/PeTTa
 cd metta-wam && make install
 petta --version   # verify
 ```
@@ -81,7 +78,6 @@ python main.py --query "buy 5% BTC"
 
 First `(Denied ...)` short-circuits. All pass = `Allow`.
 
----
 
 ## Example Prompts
 
@@ -138,7 +134,6 @@ petta sh metta/main_logic.metta
 !(market-summary)
 ```
 
----
 
 ## Project Structure
 
@@ -184,7 +179,6 @@ metta-langchain/
 (MaxPositionPct Low 15)         ; Reduce BTC max to 15%
 ```
 
----
 
 ## Why Symbolic + LLM (not either alone)
 
@@ -217,7 +211,6 @@ python main.py --check
 - Verify `metta/*.metta` files exist
 - Run: `python main.py --check`
 
----
 
 ## References
 
