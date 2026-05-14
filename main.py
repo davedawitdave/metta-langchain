@@ -119,7 +119,7 @@ def repl_mode(aco):
         elif cmd == "help":
             print(HELP)
         else:
-            aco.process(user_input)
+            print(aco.process(user_input))
 
 def check_mode():
     bridge = MeTTaBridge(metta_dir=str(METTA_DIR), petta_cmd=PETTA_CMD)
